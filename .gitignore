@@ -1,0 +1,4 @@
+rag_venv/
+_pycache_/
+hub/
+*.pdf
