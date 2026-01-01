@@ -2,104 +2,113 @@ import streamlit as st
 import torch
 import re
 import pytesseract
+import gc
+from concurrent.futures import ThreadPoolExecutor
 from pdf2image import convert_from_bytes
-from setup_models import setup_llm_and_embeddings, format_docs
+from setup_models import setup_llm_and_embeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-st.set_page_config(page_title="تحلیلگر هوشمند حرکت", layout="wide")
+st.set_page_config(page_title="سامانه مرکزی تحلیل اسناد", layout="wide", page_icon="🏢")
 
-# ۱. مدیریت تاریخچه چت (جلوگیری از حذف سوالات قبلی)
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
+if "full_raw_text" not in st.session_state:
+    st.session_state.full_raw_text = []
 
-try:
-    embeddings, llm_engine, prompt_template = setup_llm_and_embeddings()
-except Exception as e:
-    st.error(f"خطا در لود مدل: {e}")
-    st.stop()
+embeddings, llm_engine, prompt_template = setup_llm_and_embeddings()
 
 def clean_text_pro(text):
     text = text.replace("ی", "ی").replace("ک", "ک")
-    f_digits, e_digits = "۰۱۲۳۴۵۶۷۸۹", "0123456789"
-    text = text.translate(str.maketrans(f_digits, e_digits))
     text = re.sub(r'[^\u0600-\u06FF\s\d.,;?!()\-]', ' ', text)
     return " ".join(text.split())
 
+def process_single_page(args):
+    idx, image = args
+    raw_text = pytesseract.image_to_string(image, lang='fas')
+    return idx + 1, clean_text_pro(raw_text)
+
 def process_high_quality(uploaded_files, _embeddings):
     all_docs = []
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=400)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    st.session_state.full_raw_text = []
     
     for uploaded_file in uploaded_files:
-        with st.spinner(f"در حال اسکن دقیق کتاب (DPI 300)..."):
-            images = convert_from_bytes(uploaded_file.read(), dpi=300)
-            for i, image in enumerate(images):
-                raw_text = pytesseract.image_to_string(image, lang='fas')
-                cleaned = clean_text_pro(raw_text)
-                
-                # تقویت شناسنامه: کلمات کلیدی را به متادیتای صفحات اول اضافه می‌کنیم
-                prefix = ""
-                if i < 3:
-                    prefix = "[اطلاعات شناسنامه: نام کتاب، نویسنده، چاپ، قیمت، تیراژ، ناشر] "
-                
-                if len(cleaned) > 25:
-                    all_docs.append(Document(
-                        page_content=prefix + cleaned, 
-                        metadata={"page": i+1}
-                    ))
+        with st.spinner(f"در حال نمایه‌سازی سند: {uploaded_file.name}"):
+            images = convert_from_bytes(uploaded_file.read(), dpi=200)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(process_single_page, enumerate(images)))
+            
+            results.sort(key=lambda x: x[0])
+            for page_num, text in results:
+                # ذخیره متن خام برای درخواست‌های «کل متن» بدون دخالت هوش مصنوعی
+                st.session_state.full_raw_text.append(f"--- صفحه {page_num} ---\n{text}")
+                all_docs.append(Document(page_content=text, metadata={"page": page_num}))
+            gc.collect()
     
     vectorstore = FAISS.from_documents(text_splitter.split_documents(all_docs), _embeddings)
-    # k=15 برای دقت بالا در مفاهیم
-    return vectorstore.as_retriever(search_kwargs={"k": 15})
+    return vectorstore.as_retriever(search_kwargs={"k": 10})
 
-# --- پنل کناری ---
+# --- UI ---
+st.title("🏢 سامانه مرکزی استخراج دانش و تحلیل اسناد")
+st.caption("نسخه نهایی داینامیک - وفاداری مطلق به متن")
+
 with st.sidebar:
-    st.header("📂 بارگذاری کتاب")
-    files = st.file_uploader("فایل PDF", type="pdf", accept_multiple_files=True)
-    if st.button("🚀 شروع تحلیل"):
-        if files:
-            st.session_state.retriever = process_high_quality(files, embeddings)
-            st.success("تحلیل با موفقیت انجام شد.")
+    st.header("بارگذاری اسناد")
+    uploaded_files = st.file_uploader("فایل PDF را انتخاب کنید", type="pdf", accept_multiple_files=True)
+    if uploaded_files and st.button("شروع تحلیل"):
+        st.session_state.retriever = process_high_quality(uploaded_files, embeddings)
+        st.success("فرآیند با موفقیت انجام شد.")
+        st.rerun()
 
-# ۲. نمایش تاریخچه گفتگو (این بخش مانع پاک شدن سوالات قبلی می‌شود)
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    with st.chat_message(message["role"]): st.markdown(message["content"])
 
-# ۳. دریافت سوال جدید
 if prompt := st.chat_input("سوال خود را بپرسید..."):
-    # ذخیره سوال کاربر در تاریخچه
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
     if st.session_state.retriever:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"): st.markdown(prompt)
+        
         with st.chat_message("assistant"):
-            with st.spinner("در حال استخراج پاسخ..."):
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            placeholder = st.empty()
+            
+            # ۱. پاسخ مستقیم به درخواست «کل متن» (بدون استفاده از مدل برای جلوگیری از توهم)
+            if any(x in prompt for x in ["کل متن", "تمام متن", "متن کامل"]):
+                full_res = "### متن استخراج شده از کل داکیومنت:\n\n" + "\n\n".join(st.session_state.full_raw_text)
+                placeholder.markdown(full_res)
+            
+            # ۲. پاسخگویی مبتنی بر RAG
+            else:
+                full_res = ""
+                # تشخیص سوالات شناسنامه‌ای برای اولویت‌بندی صفحات اول
+                is_meta = any(k in prompt for k in ["نویسنده", "قیمت", "ناشر", "تیراژ", "چاپ", "مشخصات"])
                 
-                docs = st.session_state.retriever.invoke(prompt)
-                context = format_docs(docs)
-                
-                chain = (
-                    {"context": lambda x: context, "question": RunnablePassthrough()} 
-                    | prompt_template | llm_engine | StrOutputParser()
-                )
-                
-                response = chain.invoke(prompt)
-                pages = ", ".join(set([str(d.metadata['page']) for d in docs]))
-                full_res = f"{response}\n\n*📍 منابع:* صفحات {pages}"
-                
-                st.markdown(full_res)
-                # ذخیره پاسخ سیستم در تاریخچه
-                st.session_state.messages.append({"role": "assistant", "content": full_res})
+                if is_meta:
+                    # برای مشخصات، صفحات ابتدایی را به عنوان اولویت اول بفرست
+                    context = "\n".join(st.session_state.full_raw_text[:5])
+                else:
+                    # برای سایر سوالات، جستجوی معنایی انجام بده
+                    docs = st.session_state.retriever.invoke(prompt)
+                    context = "\n\n".join([d.page_content for d in docs])
 
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+                if context.strip():
+                    try:
+                        chain = ({"context": lambda x: context, "question": RunnablePassthrough()} | prompt_template | llm_engine | StrOutputParser())
+                        for chunk in chain.stream(prompt):
+                            full_res += chunk
+                            placeholder.markdown(full_res + "▌")
+                    except Exception:
+                        full_res = "⚠️ خطای فنی در تحلیل متن. لطفاً دوباره تلاش کنید."
+                else:
+                    full_res = "در اسناد بارگذاری شده اطلاعاتی درباره این موضوع یافت نشد."
+                
+                placeholder.markdown(full_res)
+            
+            st.session_state.messages.append({"role": "assistant", "content": full_res})
+
+if torch.cuda.is_available(): torch.cuda.empty_cache()
