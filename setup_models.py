@@ -1,3 +1,60 @@
+##setup_models.py
+# import torch
+# import warnings
+# from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+# from langchain_huggingface import HuggingFaceEmbeddings
+# from langchain_huggingface.llms import HuggingFacePipeline
+# from langchain_core.prompts import ChatPromptTemplate
+
+# MODEL_NAME = "unsloth/gemma-2-9b-it"
+# EMBEDDING_NAME = "sentence-transformers/LaBSE"
+
+# bnb_config = BitsAndBytesConfig(
+#     load_in_4bit=True,
+#     bnb_4bit_use_double_quant=True,
+#     bnb_4bit_compute_dtype=torch.float16,
+#     bnb_4bit_quant_type="nf4"
+# )
+
+# SYSTEM_TEMPLATE = """<start_of_turn>system
+# شما یک سیستم استخراج دانش سازمانی هستید که فقط بر اساس مستندات ارائه شده پاسخ می‌دهد.
+# قوانین: فقط فارسی، عدم استفاده از دانش درونی، پاسخ دقیق بر اساس بافتار متن.
+# <end_of_turn>"""
+
+# HUMAN_TEMPLATE = """<start_of_turn>user
+# بافتار متن:
+# {context}
+
+# پرسش:
+# {question}
+# <end_of_turn>
+# <start_of_turn>model
+# """
+
+# PROMPT_TEMPLATE = ChatPromptTemplate.from_messages([
+#     ("system", SYSTEM_TEMPLATE),
+#     ("human", HUMAN_TEMPLATE),
+# ])
+
+# def load_models():
+#     warnings.filterwarnings("ignore")
+#     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_NAME)
+#     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+#     model = AutoModelForCausalLM.from_pretrained(
+#         MODEL_NAME, device_map="auto", quantization_config=bnb_config, trust_remote_code=True
+#     )
+#     pipe = pipeline(
+#         "text-generation",
+#         model=model,
+#         tokenizer=tokenizer,
+#         max_new_tokens=1500,
+#         temperature=0.0,
+#         do_sample=False
+#     )
+#     return embeddings, HuggingFacePipeline(pipeline=pipe), PROMPT_TEMPLATE
+
+
+
 import os
 import torch
 import warnings
