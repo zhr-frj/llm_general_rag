@@ -2,3 +2,8 @@ rag_venv/
 _pycache_/
 hub/
 *.pdf
+models/
+torchinductor_sysadmin/
+data/vectorstore/
+.bin
+.safetensors

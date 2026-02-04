@@ -1,132 +1,40 @@
 import streamlit as st
 import torch
-import re
-import pytesseract
-import gc
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
+import os
+import json
+import re
+from pathlib import Path
 from pdf2image import convert_from_bytes
+import pytesseract
+from concurrent.futures import ThreadPoolExecutor
+
+# وارد کردن توابع از دو فایل دیگر
 from setup_models import setup_llm_and_embeddings
+from vector_manager import load_vectorstore_on_gpu, search_documents # <--- اضافه شد
+
 from langchain_community.vectorstores import FAISS
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
-from pathlib import Path
-import datetime
-import json
-
-# ==========================
-# مسیرها و پوشه‌ها
-# ==========================
+# تنظیمات مسیرها
+os.environ['TESSDATA_PREFIX'] = os.path.abspath("./models/")
 DATA_DIR = Path("data")
 OCR_DIR = DATA_DIR / "ocr_texts"
 METADATA_DIR = DATA_DIR / "metadata"
-
+INDEX_PATH = "models/faiss_index" # مسیر ذخیره دیتابیس روی هارد
 OCR_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(
-    page_title="سامانه مرکزی تحلیل اسناد",
-    layout="wide",
-    page_icon="🏢"
-)
+st.set_page_config(page_title="سامانه تحلیل اسناد Enterprise", layout="wide")
 
-# ==========================
-# session state ها
-# ==========================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# بارگذاری مدل‌ها
+embeddings, llm_engine, prompt_template, (rerank_model, rerank_tokenizer) = setup_llm_and_embeddings()
 
-if "retriever" not in st.session_state:
-    st.session_state.retriever = None
+# --- توابع سیستمی ---
 
-if "full_raw_text" not in st.session_state:
-    st.session_state.full_raw_text = []
-
-if "metadata_text" not in st.session_state:
-    st.session_state.metadata_text = []
-
-if "processed_hashes" not in st.session_state:
-    st.session_state.processed_hashes = set()
-
-# ==========================
-# مدل‌ها
-# ==========================
-embeddings, llm_engine, prompt_template = setup_llm_and_embeddings()
-
-# ==========================
-# 🔑 تابع جدید: دریافت «کل متن» بدون LLM و RAG
-# ==========================
-def get_full_documents_text():
-    texts = []
-    for metadata_file in METADATA_DIR.glob("*.json"):
-        with open(metadata_file, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        ocr_path = Path(metadata["ocr_text_path"])
-        if ocr_path.exists():
-            with open(ocr_path, "r", encoding="utf-8") as f:
-                text = f.read()
-            texts.append(
-                f"--- {metadata['original_filename']} ---\n{text}"
-            )
-
-    return "\n\n".join(texts)
-
-# ==========================
-# بارگذاری اسناد قبلی
-# ==========================
-def load_existing_documents(_embeddings):
-    all_docs = []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-
-    st.session_state.full_raw_text = []
-    st.session_state.metadata_text = []
-
-    for metadata_file in METADATA_DIR.glob("*.json"):
-        with open(metadata_file, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        if "book_metadata_text" in metadata:
-            st.session_state.metadata_text.extend(metadata["book_metadata_text"])
-
-        ocr_path = Path(metadata["ocr_text_path"])
-        if not ocr_path.exists():
-            continue
-
-        with open(ocr_path, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        st.session_state.full_raw_text.append(
-            f"--- {metadata['original_filename']} ---\n{text}"
-        )
-
-        for i, chunk in enumerate(splitter.split_text(text)):
-            all_docs.append(
-                Document(
-                    page_content=chunk,
-                    metadata={
-                        "filename": metadata["original_filename"],
-                        "chunk_id": i
-                    }
-                )
-            )
-
-    if all_docs:
-        vs = FAISS.from_documents(all_docs, _embeddings)
-        return vs.as_retriever(search_kwargs={"k": 8})
-
-    return None
-
-
-if st.session_state.retriever is None:
-    st.session_state.retriever = load_existing_documents(embeddings)
-
-# ==========================
-# OCR utils
-# ==========================
 def clean_text(text):
     text = text.replace("ی", "ی").replace("ک", "ک")
     text = re.sub(r'[^\u0600-\u06FF\s\d.,;?!()\-]', ' ', text)
@@ -137,171 +45,114 @@ def process_single_page(args):
     raw = pytesseract.image_to_string(image, lang="fas")
     return idx + 1, clean_text(raw)
 
-# ==========================
-# OCR + ذخیره‌سازی امن
-# ==========================
-def process_high_quality_v2(uploaded_files, _embeddings):
+def index_documents_from_disk(_embeddings):
+    """اسکن هارد، ساخت ایندکس و انتقال به GPU از طریق vector_manager"""
     all_docs = []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    st.session_state.full_raw_text = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=250)
 
-    META_HINTS = ["شابک", "ISBN", "انتشارات", "ناشر", "چاپ", "قیمت", "ریال", "تومان"]
+    meta_files = list(METADATA_DIR.glob("*.json"))
+    if not meta_files: return None
 
-    for uploaded_file in uploaded_files:
-        original_name = uploaded_file.name
-        today = datetime.date.today().strftime("%Y%m%d")
-
-        file_bytes = uploaded_file.read()
-        file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
-        uploaded_file.seek(0)
-
-        if file_hash in st.session_state.processed_hashes:
-            st.info("این فایل قبلاً در این نشست پردازش شده است.")
-            continue
-
-        st.session_state.processed_hashes.add(file_hash)
-
-        base_filename = f"{file_hash}_{original_name.replace(' ', '')}"
-        ocr_path = OCR_DIR / f"{base_filename}.txt"
-        metadata_path = METADATA_DIR / f"{base_filename}.json"
-        lock_path = METADATA_DIR / f"{base_filename}.lock"
-
-        if lock_path.exists():
-            st.warning("⏳ این فایل در حال پردازش توسط کاربر دیگری است.")
-            continue
-
-        if metadata_path.exists() and ocr_path.exists():
-            st.info(f"فایل {original_name} قبلاً OCR شده است.")
-            continue
-
-        lock_path.touch()
-
+    for meta_file in meta_files:
         try:
-            with st.spinner(f"در حال OCR: {original_name}"):
-                images = convert_from_bytes(uploaded_file.read(), dpi=200)
-                pages = []
-
-                with ThreadPoolExecutor(max_workers=4) as ex:
-                    results = list(ex.map(process_single_page, enumerate(images)))
-
-                results.sort(key=lambda x: x[0])
-                meta_texts = []
-
-                for page_num, page_text in results:
-                    pages.append(page_text)
-                    all_docs.append(
-                        Document(
-                            page_content=page_text,
-                            metadata={"filename": original_name, "page": page_num}
-                        )
-                    )
-                    if any(k in page_text for k in META_HINTS):
-                        meta_texts.append(page_text)
-
-                with open(ocr_path, "w", encoding="utf-8") as f:
-                    f.write("\n\n".join(pages))
-
-                metadata = {
-                    "original_filename": original_name,
-                    "ocr_text_path": str(ocr_path),
-                    "upload_date": today,
-                    "num_pages": len(pages),
-                    "book_metadata_text": meta_texts
-                }
-
-                with open(metadata_path, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-                st.session_state.metadata_text.extend(meta_texts)
-
-        finally:
-            if lock_path.exists():
-                lock_path.unlink()
-            gc.collect()
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            ocr_path = Path(meta["ocr_text_path"])
+            if ocr_path.exists():
+                with open(ocr_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                if text.strip():
+                    for chunk in splitter.split_text(text):
+                        all_docs.append(Document(page_content=chunk, metadata={"source": meta["original_filename"]}))
+        except: continue
 
     if all_docs:
+        # ۱. ساخت دیتابیس موقت در رم
         vs = FAISS.from_documents(all_docs, _embeddings)
-        return vs.as_retriever(search_kwargs={"k": 8})
-
+        # ۲. ذخیره روی هارد برای استفاده‌های بعدی
+        vs.save_local(INDEX_PATH)
+        # ۳. استفاده از فایل vector_manager برای انتقال به GPU 1 و پاکسازی حافظه
+        vs_gpu = load_vectorstore_on_gpu(INDEX_PATH, _embeddings)
+        return vs_gpu
     return None
 
-# ==========================
-# UI
-# ==========================
-st.title("🏢 سامانه مرکزی استخراج دانش و تحلیل اسناد")
-st.caption("نسخه پایدار چندکاربره")
+def apply_reranking(query, documents):
+    if not documents: return []
+    pairs = [[query, doc.page_content] for doc in documents]
+    device = next(rerank_model.parameters()).device
+    with torch.no_grad():
+        inputs = rerank_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        scores = rerank_model(**inputs).logits.view(-1,).float()
+        combined = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+        return [doc for doc, score in combined[:8]]
+
+# --- شروع منطق اصلی برنامه ---
+
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = index_documents_from_disk(embeddings)
+
+st.title("🏢 سامانه هوشمند استخراج دانش")
 
 with st.sidebar:
-    uploaded_files = st.file_uploader(
-        "فایل PDF را انتخاب کنید",
-        type="pdf",
-        accept_multiple_files=True
-    )
+    st.subheader("مدیریت اسناد")
+    uploaded_files = st.file_uploader("آپلود PDF", type="pdf", accept_multiple_files=True)
 
-    if uploaded_files and st.button("شروع تحلیل"):
-        process_high_quality_v2(uploaded_files, embeddings)
-        st.session_state.retriever = load_existing_documents(embeddings)
-        st.success("پردازش انجام شد.")
+    if uploaded_files and st.button("تحلیل و ایندکس گذاری"):
+        for uploaded_file in uploaded_files:
+            file_bytes = uploaded_file.read()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
+            base_name = f"{file_hash}_{uploaded_file.name.replace(' ', '')}"
+            ocr_path = OCR_DIR / f"{base_name}.txt"
+
+            if not ocr_path.exists():
+                with st.spinner(f"🔄 در حال OCR: {uploaded_file.name}"):
+                    images = convert_from_bytes(file_bytes, dpi=200)
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        results = list(ex.map(process_single_page, enumerate(images)))
+                    results.sort(key=lambda x: x[0])
+                    full_text = "\n\n".join([r[1] for r in results])
+                    with open(ocr_path, "w", encoding="utf-8") as f: f.write(full_text)
+                    with open(METADATA_DIR / f"{base_name}.json", "w", encoding="utf-8") as f:
+                        json.dump({"original_filename": uploaded_file.name, "ocr_text_path": str(ocr_path)}, f)
+        
+        st.session_state.vectorstore = index_documents_from_disk(embeddings)
         st.rerun()
 
-# ==========================
-# Chat
-# ==========================
+    if st.button("پاکسازی گفتگو"):
+        st.session_state.messages = []
+        st.rerun()
+
+if "messages" not in st.session_state: st.session_state.messages = []
 for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+    with st.chat_message(m["role"]): st.markdown(m["content"])
 
 if prompt := st.chat_input("سوال خود را بپرسید..."):
-    if not st.session_state.retriever:
-        st.warning("هیچ سندی بارگذاری نشده است.")
-    else:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"): st.markdown(prompt)
 
-        with st.chat_message("assistant"):
+    with st.chat_message("assistant"):
+        if st.session_state.vectorstore is None:
+            st.session_state.vectorstore = index_documents_from_disk(embeddings)
+
+        if st.session_state.vectorstore:
             placeholder = st.empty()
+            # استفاده از تابع جستجو در vector_manager (با حفظ تنظیمات قبلی k=20)
+            raw_docs = st.session_state.vectorstore.similarity_search(prompt, k=20)
+            final_docs = apply_reranking(prompt, raw_docs)
 
-            # 🔑 شرط جدید: درخواست «کل متن»
-            if any(x in prompt for x in ["کل متن", "تمام متن", "متن کامل"]):
-                full_text = get_full_documents_text()
-                if not full_text.strip():
-                    placeholder.markdown("ℹ️ هنوز متنی برای نمایش وجود ندارد.")
-                else:
-                    placeholder.markdown("### 📄 متن کامل اسناد:\n\n" + full_text)
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": full_text
-                })
-                st.stop()  
+            context = "\n\n".join(d.page_content for d in final_docs)
+            chain = (
+                {"context": lambda _: context, "question": RunnablePassthrough()}
+                | prompt_template | llm_engine | StrOutputParser()
+            )
 
             full_res = ""
-            is_meta = any(k in prompt for k in ["نویسنده", "ناشر", "قیمت", "شابک", "ISBN"])
-
-            if is_meta and st.session_state.metadata_text:
-                context = "\n\n".join(st.session_state.metadata_text)
-            else:
-                docs = st.session_state.retriever.invoke(prompt)
-                context = "\n\n".join(d.page_content for d in docs)
-
-            context = context[:6000]
-
-            try:
-                chain = (
-                    {"context": lambda _: context, "question": RunnablePassthrough()}
-                    | prompt_template
-                    | llm_engine
-                    | StrOutputParser()
-                )
-                for chunk in chain.stream(prompt):
-                    full_res += chunk
-                    placeholder.markdown(full_res + "▌")
-            except Exception:
-                full_res = "⚠️ خطا در پردازش پاسخ."
-
+            for chunk in chain.stream(prompt):
+                full_res += chunk
+                placeholder.markdown(full_res + "▌")
             placeholder.markdown(full_res)
             st.session_state.messages.append({"role": "assistant", "content": full_res})
+        else:
+            st.error("❌ دیتابیس خالی است.")
 
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+if torch.cuda.is_available(): torch.cuda.empty_cache()
